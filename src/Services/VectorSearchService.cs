@@ -32,13 +32,49 @@ public sealed class VectorSearchService
     private const int BlockSlots = 8;
     private const int BlockSize = Dim * BlockSlots;
     private const int K = 5;
-    private const int FastProbes = 5;
-    private const int FullProbes = 20;
+    private readonly int _fastProbes;
+    private readonly int _fullProbes;
+    private readonly int _hardQueryProbes;
+    private readonly int _borderlineMinVotes;
+    private readonly int _borderlineMaxVotes;
+    private readonly bool _hardQueryEnabled;
+    private readonly bool _highConfidenceFraudBumpEnabled;
 
     public bool IsReady => _isReady;
 
+    public VectorSearchService()
+    {
+        _fastProbes = ReadEnvInt("FAST_PROBES", 5, 1, 256);
+        _fullProbes = ReadEnvInt("FULL_PROBES", 20, _fastProbes, 256);
+        _hardQueryProbes = ReadEnvInt("HARD_QUERY_PROBES", 24, _fullProbes, 256);
+        _borderlineMinVotes = ReadEnvInt("BORDERLINE_MIN_VOTES", 2, 0, K);
+        _borderlineMaxVotes = ReadEnvInt("BORDERLINE_MAX_VOTES", 3, _borderlineMinVotes, K);
+        _hardQueryEnabled = ReadEnvBool("HARD_QUERY_ENABLED", false);
+        _highConfidenceFraudBumpEnabled = ReadEnvBool("HIGH_CONFIDENCE_FRAUD_BUMP", true);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ReadEnvInt(string key, int fallback, int min, int max)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out var parsed))
+            return Math.Clamp(parsed, min, max);
+        return fallback;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ReadEnvBool(string key, bool fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrEmpty(raw)) return fallback;
+        if (raw == "1" || raw.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (raw == "0" || raw.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+        return fallback;
+    }
+
     public void LoadData()
     {
+        Array.Fill(_mccRisk, 0.5f);
         for (var i = 0; i < MccKeys.Length; i++)
             _mccRisk[MccKeys[i] & MccMask] = MccValues[i];
 
@@ -150,7 +186,49 @@ public sealed class VectorSearchService
         q[12] = GetMccRisk(mccInt);
         q[13] = Clamp01((float)merchantAvgAmount / MaxMerchantAvgAmount);
 
-        return KnnSearch(q);
+        var isHardQuery = IsHardQuery(q);
+        var fraudCount = KnnSearch(q, isHardQuery);
+        if (_highConfidenceFraudBumpEnabled && fraudCount < 3)
+        {
+            if (IsVeryHighConfidenceFraud(q))
+                return 3;
+
+            if (fraudCount == 2 && IsHighConfidenceFraud(q))
+                return 3;
+        }
+        return fraudCount;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsHardQuery(ReadOnlySpan<float> query)
+    {
+        if (!_hardQueryEnabled) return false;
+        var highAmountVsAverage = query[2] >= 0.90f;
+        var unknownMerchant = query[11] >= 0.5f;
+        var onlineWithoutCard = query[9] >= 0.5f && query[10] <= 0.5f;
+        var highDistanceOrVelocity = query[7] >= 0.75f || query[8] >= 0.8f;
+        return highAmountVsAverage && unknownMerchant && onlineWithoutCard && highDistanceOrVelocity;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsVeryHighConfidenceFraud(ReadOnlySpan<float> query)
+    {
+        var highAmountVsAverage = query[2] >= 0.90f;
+        var unknownMerchant = query[11] >= 0.5f;
+        var onlineWithoutCard = query[9] >= 0.5f && query[10] <= 0.5f;
+        var highDistanceOrVelocity = query[7] >= 0.60f || query[8] >= 0.60f;
+        return highAmountVsAverage && unknownMerchant && onlineWithoutCard && highDistanceOrVelocity;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsHighConfidenceFraud(ReadOnlySpan<float> query)
+    {
+        var unknownMerchant = query[11] >= 0.5f;
+        var onlineWithoutCard = query[9] >= 0.5f && query[10] <= 0.5f;
+        var highMccRisk = query[12] >= 0.75f;
+        var elevatedAmountVsAverage = query[2] >= 0.60f;
+        var highDistanceOrVelocity = query[7] >= 0.50f || query[8] >= 0.50f;
+        return unknownMerchant && onlineWithoutCard && highMccRisk && elevatedAmountVsAverage && highDistanceOrVelocity;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -185,20 +263,29 @@ public sealed class VectorSearchService
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int KnnSearch(ReadOnlySpan<float> query)
+    private int ScanWithProbes(ReadOnlySpan<float> query, int requestedProbeCount)
     {
-        Span<int> fastClusters = stackalloc int[FastProbes];
-        Span<float> fastDists = stackalloc float[FastProbes];
-        FindTopNClusters(query, FastProbes, fastClusters, fastDists);
+        var probeCount = Math.Clamp(requestedProbeCount, 1, _numClusters);
+        Span<int> probeClusters = stackalloc int[probeCount];
+        Span<float> probeDists = stackalloc float[probeCount];
+        FindTopNClusters(query, probeCount, probeClusters, probeDists);
+        return ScanBlocks(query, probeClusters);
+    }
 
-        var fastResult = ScanBlocks(query, fastClusters);
-        if (fastResult != 2 && fastResult != 3)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int KnnSearch(ReadOnlySpan<float> query, bool isHardQuery)
+    {
+        var fastResult = ScanWithProbes(query, _fastProbes);
+        var isBorderline = fastResult >= _borderlineMinVotes && fastResult <= _borderlineMaxVotes;
+
+        if (!isBorderline)
             return fastResult;
 
-        Span<int> fullClusters = stackalloc int[FullProbes];
-        Span<float> fullDists = stackalloc float[FullProbes];
-        FindTopNClusters(query, FullProbes, fullClusters, fullDists);
-        return ScanBlocks(query, fullClusters);
+        var fullResult = ScanWithProbes(query, _fullProbes);
+        if (!isHardQuery || fullResult != 2 || _hardQueryProbes <= _fullProbes)
+            return fullResult;
+
+        return ScanWithProbes(query, _hardQueryProbes);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -223,10 +310,13 @@ public sealed class VectorSearchService
             {
                 var blockBase = bi * BlockSize;
                 var labelBase = bi * BlockSlots;
-                var threshold = worstDist;
 
                 for (var slot = 0; slot < BlockSlots; slot++)
                 {
+                    // Padded slots use short.MaxValue as sentinel in dim 0.
+                    if (blocks[blockBase + slot] == short.MaxValue) continue;
+
+                    var threshold = worstDist;
                     var dist = 0.0f;
                     var rejected = false;
 
@@ -258,7 +348,7 @@ public sealed class VectorSearchService
                         case 4: topDist4 = dist; topLabel4 = label; break;
                     }
 
-                    worstDist = float.MaxValue;
+                    worstDist = topDist0;
                     worstIdx = 0;
                     if (topDist1 > worstDist) { worstDist = topDist1; worstIdx = 1; }
                     if (topDist2 > worstDist) { worstDist = topDist2; worstIdx = 2; }
