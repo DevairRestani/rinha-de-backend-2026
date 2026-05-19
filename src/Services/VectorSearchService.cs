@@ -47,10 +47,10 @@ public sealed class VectorSearchService
         _fastProbes = ReadEnvInt("FAST_PROBES", 5, 1, 256);
         _fullProbes = ReadEnvInt("FULL_PROBES", 20, _fastProbes, 256);
         _hardQueryProbes = ReadEnvInt("HARD_QUERY_PROBES", 24, _fullProbes, 256);
-        _borderlineMinVotes = ReadEnvInt("BORDERLINE_MIN_VOTES", 2, 0, K);
+        _borderlineMinVotes = ReadEnvInt("BORDERLINE_MIN_VOTES", 1, 0, K);
         _borderlineMaxVotes = ReadEnvInt("BORDERLINE_MAX_VOTES", 3, _borderlineMinVotes, K);
         _hardQueryEnabled = ReadEnvBool("HARD_QUERY_ENABLED", false);
-        _highConfidenceFraudBumpEnabled = ReadEnvBool("HIGH_CONFIDENCE_FRAUD_BUMP", true);
+        _highConfidenceFraudBumpEnabled = ReadEnvBool("HIGH_CONFIDENCE_FRAUD_BUMP", false);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
