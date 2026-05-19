@@ -55,24 +55,24 @@ if (!string.IsNullOrEmpty(sockPath))
 
 app.MapGet("/ready", () => vectorService.IsReady ? Results.Ok() : Results.StatusCode(503));
 
-app.MapPost("/fraud-score", (HttpContext ctx) =>
+app.MapPost("/fraud-score", async ctx =>
 {
     if (!vectorService.IsReady)
     {
         ctx.Response.StatusCode = 503;
-        return Task.CompletedTask;
+        return;
     }
 
     var contentLength = (int?)ctx.Request.ContentLength ?? 0;
     if (contentLength <= 0 || contentLength > 4096)
     {
         ctx.Response.StatusCode = 400;
-        return Task.CompletedTask;
+        return;
     }
 
     var buf = ArrayPool<byte>.Shared.Rent(contentLength);
     var ms = new MemoryStream(buf, 0, contentLength);
-    ctx.Request.Body.CopyTo(ms);
+    await ctx.Request.Body.CopyToAsync(ms);
     var read = (int)ms.Position;
 
     var fraudCount = ParseAndDetect(buf.AsSpan(0, read), vectorService);
@@ -95,15 +95,18 @@ app.MapPost("/fraud-score", (HttpContext ctx) =>
     ",\"fraud_score\":"u8.CopyTo(resp[pos..]); pos += 15;
     ReadOnlySpan<byte> scoreStr = score switch
     {
-        0.0f => "0.0"u8, 0.2f => "0.2"u8, 0.4f => "0.4"u8,
-        0.6f => "0.6"u8, 0.8f => "0.8"u8, 1.0f => "1.0"u8,
+        0.0f => "0.0"u8,
+        0.2f => "0.2"u8,
+        0.4f => "0.4"u8,
+        0.6f => "0.6"u8,
+        0.8f => "0.8"u8,
+        1.0f => "1.0"u8,
         _ => "0.0"u8
     };
     scoreStr.CopyTo(resp[pos..]); pos += scoreStr.Length;
     resp[pos++] = (byte)'}';
 
     ctx.Response.Body.Write(resp[..pos]);
-    return Task.CompletedTask;
 });
 
 app.Run();
