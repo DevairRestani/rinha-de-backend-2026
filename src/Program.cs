@@ -1,23 +1,342 @@
+using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Text;
+using RinhaFraudDetection.Services;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+builder.Services.AddSingleton<VectorSearchService>();
 
-builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
-builder.Services.AddOpenApi();
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.AllowSynchronousIO = true;
+    o.Limits.MaxConcurrentConnections = int.MaxValue;
+    o.Limits.MaxConcurrentUpgradedConnections = int.MaxValue;
+    o.Limits.MaxRequestBodySize = 4096;
+    o.Limits.MinRequestBodyDataRate = null;
+    o.Limits.MinResponseDataRate = null;
+});
+
+ThreadPool.SetMinThreads(Environment.ProcessorCount * 4, Environment.ProcessorCount * 4);
+
+var sockPath = Environment.GetEnvironmentVariable("SOCK");
+if (!string.IsNullOrEmpty(sockPath))
+{
+    if (File.Exists(sockPath)) File.Delete(sockPath);
+    var dir = Path.GetDirectoryName(sockPath);
+    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+    builder.WebHost.ConfigureKestrel(o => o.ListenUnixSocket(sockPath));
+}
+else
+{
+    builder.WebHost.ConfigureKestrel(o => o.ListenAnyIP(8080));
+}
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+var vectorService = app.Services.GetRequiredService<VectorSearchService>();
+vectorService.LoadData();
+
+if (!string.IsNullOrEmpty(sockPath))
 {
-    app.MapOpenApi();
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        try
+        {
+            if (File.Exists(sockPath))
+            {
+                using var chmod = System.Diagnostics.Process.Start("chmod", $"666 {sockPath}");
+                chmod?.WaitForExit(1000);
+            }
+        }
+        catch { }
+    });
 }
 
-app.UseHttpsRedirection();
+app.MapGet("/ready", () => vectorService.IsReady ? Results.Ok() : Results.StatusCode(503));
 
-app.UseAuthorization();
+app.MapPost("/fraud-score", (HttpContext ctx) =>
+{
+    if (!vectorService.IsReady)
+    {
+        ctx.Response.StatusCode = 503;
+        return Task.CompletedTask;
+    }
 
-app.MapControllers();
+    var contentLength = (int?)ctx.Request.ContentLength ?? 0;
+    if (contentLength <= 0 || contentLength > 4096)
+    {
+        ctx.Response.StatusCode = 400;
+        return Task.CompletedTask;
+    }
+
+    var buf = ArrayPool<byte>.Shared.Rent(contentLength);
+    var ms = new MemoryStream(buf, 0, contentLength);
+    ctx.Request.Body.CopyTo(ms);
+    var read = (int)ms.Position;
+
+    var fraudCount = ParseAndDetect(buf.AsSpan(0, read), vectorService);
+    ArrayPool<byte>.Shared.Return(buf);
+
+    var score = fraudCount / 5f;
+    var approved = score < 0.6f;
+
+    ctx.Response.StatusCode = 200;
+    ctx.Response.ContentType = "application/json";
+    ctx.Response.ContentLength = approved ? 35 : 36;
+
+    Span<byte> resp = stackalloc byte[40];
+    resp.Clear();
+    var pos = 0;
+    "{"u8.CopyTo(resp[pos..]); pos += 1;
+    "\"approved\":"u8.CopyTo(resp[pos..]); pos += 11;
+    if (approved) { "true"u8.CopyTo(resp[pos..]); pos += 4; }
+    else { "false"u8.CopyTo(resp[pos..]); pos += 5; }
+    ",\"fraud_score\":"u8.CopyTo(resp[pos..]); pos += 15;
+    ReadOnlySpan<byte> scoreStr = score switch
+    {
+        0.0f => "0.0"u8, 0.2f => "0.2"u8, 0.4f => "0.4"u8,
+        0.6f => "0.6"u8, 0.8f => "0.8"u8, 1.0f => "1.0"u8,
+        _ => "0.0"u8
+    };
+    scoreStr.CopyTo(resp[pos..]); pos += scoreStr.Length;
+    resp[pos++] = (byte)'}';
+
+    ctx.Response.Body.Write(resp[..pos]);
+    return Task.CompletedTask;
+});
 
 app.Run();
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static int ParseAndDetect(ReadOnlySpan<byte> buf, VectorSearchService svc)
+{
+    var p = 0;
+    var len = buf.Length;
+
+    SkipToKey(ref p, buf, "amount"u8);
+    var amount = ScanFloat(ref p, buf);
+
+    SkipToKey(ref p, buf, "installments"u8);
+    var installments = ScanInt(ref p, buf);
+
+    SkipToKey(ref p, buf, "requested_at"u8);
+    var (reqYear, reqMo, reqDay, reqHour, reqMin) = ScanDateTime(ref p, buf);
+
+    SkipToKey(ref p, buf, "avg_amount"u8);
+    var avgAmount = ScanFloat(ref p, buf);
+
+    SkipToKey(ref p, buf, "tx_count_24h"u8);
+    var txCount = ScanInt(ref p, buf);
+
+    SkipToKey(ref p, buf, "known_merchants"u8);
+    var merchantSlices = ScanStringArray(ref p, buf);
+
+    SkipToKey(ref p, buf, "\"id"u8);
+    var merchantId = ScanStringSpan(ref p, buf);
+
+    SkipToKey(ref p, buf, "mcc"u8);
+    var mccSpan = ScanStringSpan(ref p, buf);
+
+    SkipToKey(ref p, buf, "merchant_avg_amount"u8);
+    var merchantAvgAmount = ScanFloat(ref p, buf);
+
+    SkipToKey(ref p, buf, "is_online"u8);
+    var isOnline = ScanBool(ref p, buf);
+
+    SkipToKey(ref p, buf, "card_present"u8);
+    var cardPresent = ScanBool(ref p, buf);
+
+    SkipToKey(ref p, buf, "km_from_home"u8);
+    var kmFromHome = ScanFloat(ref p, buf);
+
+    SkipToKey(ref p, buf, "last_transaction"u8);
+    bool hasLastTx;
+    double minutesSinceLast = 0, kmFromCurrent = 0;
+    if (p < len && buf[p] == 'n')
+    {
+        hasLastTx = false;
+    }
+    else
+    {
+        hasLastTx = true;
+        SkipToKey(ref p, buf, "timestamp"u8);
+        var (lastYear, lastMo, lastDay, lastHour, lastMin) = ScanDateTime(ref p, buf);
+
+        SkipToKey(ref p, buf, "km_from_current"u8);
+        kmFromCurrent = ScanFloat(ref p, buf);
+
+        minutesSinceLast = MinutesBetween(lastYear, lastMo, lastDay, lastHour, lastMin,
+                                           reqYear, reqMo, reqDay, reqHour, reqMin);
+    }
+
+    var isUnknownMerchant = true;
+    if (merchantSlices != null && merchantId.Length > 0)
+    {
+        for (var i = 0; i < merchantSlices.Count; i++)
+        {
+            var s = merchantSlices[i].Span;
+            if (s.Length == merchantId.Length && s.SequenceEqual(merchantId))
+            {
+                isUnknownMerchant = false;
+                break;
+            }
+        }
+    }
+
+    Span<char> mccBuf = stackalloc char[8];
+    var mccLen = Math.Min(mccSpan.Length, 8);
+    for (var i = 0; i < mccLen; i++) mccBuf[i] = (char)mccSpan[i];
+
+    return svc.VectorizeAndSearch(
+        amount, installments, reqHour, DayOfWeek(reqYear, reqMo, reqDay),
+        avgAmount, txCount,
+        mccBuf.Slice(0, mccLen), merchantAvgAmount,
+        isOnline, cardPresent, kmFromHome,
+        hasLastTx, minutesSinceLast, kmFromCurrent,
+        isUnknownMerchant);
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static void SkipToKey(ref int p, ReadOnlySpan<byte> buf, ReadOnlySpan<byte> key)
+{
+    var len = buf.Length;
+    var keyLen = key.Length;
+    while (p <= len - keyLen)
+    {
+        if (buf[p] != '"') { p++; continue; }
+        if (buf.Slice(p + 1, keyLen).SequenceEqual(key) && buf[p + 1 + keyLen] == '"')
+        {
+            p += 1 + keyLen + 1;
+            while (p < len && buf[p] != ':') p++;
+            p++;
+            while (p < len && (buf[p] == ' ' || buf[p] == '\t' || buf[p] == '\n' || buf[p] == '\r')) p++;
+            return;
+        }
+        p++;
+    }
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static double ScanFloat(ref int p, ReadOnlySpan<byte> buf)
+{
+    var neg = false;
+    if (p < buf.Length && buf[p] == '-') { neg = true; p++; }
+    long intPart = 0;
+    while (p < buf.Length && (uint)(buf[p] - '0') <= 9)
+        intPart = intPart * 10 + (buf[p++] - '0');
+    double v = intPart;
+    if (p < buf.Length && buf[p] == '.')
+    {
+        p++;
+        double frac = 0, div = 1;
+        while (p < buf.Length && (uint)(buf[p] - '0') <= 9)
+        {
+            frac = frac * 10 + (buf[p++] - '0');
+            div *= 10;
+        }
+        v += frac / div;
+    }
+    return neg ? -v : v;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static int ScanInt(ref int p, ReadOnlySpan<byte> buf)
+{
+    var v = 0;
+    while (p < buf.Length && (uint)(buf[p] - '0') <= 9)
+        v = v * 10 + (buf[p++] - '0');
+    return v;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static bool ScanBool(ref int p, ReadOnlySpan<byte> buf)
+{
+    if (p < buf.Length && buf[p] == 't') { p += 4; return true; }
+    p += 5;
+    return false;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static ReadOnlySpan<byte> ScanStringSpan(ref int p, ReadOnlySpan<byte> buf)
+{
+    if (p < buf.Length && buf[p] == '"') p++;
+    var start = p;
+    while (p < buf.Length && buf[p] != '"') p++;
+    var result = buf.Slice(start, p - start);
+    if (p < buf.Length) p++;
+    return result;
+}
+
+static List<ReadOnlyMemory<byte>>? ScanStringArray(ref int p, ReadOnlySpan<byte> buf)
+{
+    var len = buf.Length;
+    if (p < len && buf[p] == 'n') { p += 4; return null; }
+    if (p < len && buf[p] == '[') p++;
+
+    var list = new List<ReadOnlyMemory<byte>>(4);
+    while (p < len && buf[p] != ']')
+    {
+        if (buf[p] == '"')
+        {
+            p++;
+            var start = p;
+            while (p < len && buf[p] != '"') p++;
+            list.Add(buf.Slice(start, p - start).ToArray());
+            if (p < len) p++;
+        }
+        else
+        {
+            p++;
+        }
+    }
+    if (p < len) p++;
+    return list;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static (int year, int mo, int day, int hour, int min) ScanDateTime(ref int p, ReadOnlySpan<byte> buf)
+{
+    if (p < buf.Length && buf[p] == '"') p++;
+    if (p + 19 > buf.Length) return (2025, 1, 1, 12, 0);
+
+    var y = (buf[p] - '0') * 1000 + (buf[p + 1] - '0') * 100 + (buf[p + 2] - '0') * 10 + (buf[p + 3] - '0');
+    var mo = (buf[p + 5] - '0') * 10 + (buf[p + 6] - '0');
+    var d = (buf[p + 8] - '0') * 10 + (buf[p + 9] - '0');
+    var h = (buf[p + 11] - '0') * 10 + (buf[p + 12] - '0');
+    var mi = (buf[p + 14] - '0') * 10 + (buf[p + 15] - '0');
+    p += 19;
+    while (p < buf.Length && buf[p] != '"') p++;
+    if (p < buf.Length) p++;
+
+    return (y, mo, d, h, mi);
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static int DayOfWeek(int y, int m, int d)
+{
+    ReadOnlySpan<int> t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    var ya = m < 3 ? y - 1 : y;
+    var dow = (ya + ya / 4 - ya / 100 + ya / 400 + t[m - 1] + d) % 7;
+    return (dow + 6) % 7;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static long DaysSinceEpoch(int y, int m, int d)
+{
+    if (m <= 2) y--;
+    var era = y >= 0 ? y / 400 : (y - 399) / 400;
+    var yoe = y - era * 400;
+    var mm = m > 2 ? m - 3 : m + 9;
+    var doy = (153 * mm + 2) / 5 + d - 1;
+    var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (long)era * 146097 + doe - 719468;
+}
+
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+static double MinutesBetween(int y1, int mo1, int d1, int h1, int mi1, int y2, int mo2, int d2, int h2, int mi2)
+{
+    var m1 = DaysSinceEpoch(y1, mo1, d1) * 1440 + h1 * 60 + mi1;
+    var m2 = DaysSinceEpoch(y2, mo2, d2) * 1440 + h2 * 60 + mi2;
+    return Math.Max(0, m2 - m1);
+}

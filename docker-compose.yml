@@ -1,42 +1,53 @@
 services:
-  api1:
-    build: ./src
+  api1: &api
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: rinha-fraud:latest
     hostname: api1
+    environment:
+      - SOCK=/run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.425"
+          cpus: "0.45"
           memory: "160MB"
-    networks:
-      - rinha-net
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
+
   api2:
-    build: ./src
-    image: rinha-fraud:latest
+    <<: *api
+    build: !reset null
     hostname: api2
-    deploy:
-      resources:
-        limits:
-          cpus: "0.425"
-          memory: "160MB"
-    networks:
-      - rinha-net
-  nginx:
-    image: nginx:latest
-    ports:
-      - "9999:9999"
+    environment:
+      - SOCK=/run/sock/api2.sock
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    restart: always
     depends_on:
       - api1
       - api2
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.15"
+          cpus: "0.1"
           memory: "30MB"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      - rinha-net
-networks:
-  rinha-net:
-    driver: bridge
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  sock:
