@@ -18,6 +18,9 @@ const int BlockSize = Dim * BlockSlots;
 const int NumClusters = 256;
 const int KmeansIterations = 8;
 const int SampleSize = 300_000;
+const int PruneMinClusterSize = 8_000;
+const float PruneMaxFraudRatio = 0.01f;
+const float PruneLegitCoreFraction = 0.65f;
 
 var capacity = 3_500_000;
 var rawVectors = new float[capacity * Dim];
@@ -155,6 +158,116 @@ Array.Copy(clusterOffsets, tempOffsets, actualNumClusters);
 for (var i = 0; i < count; i++)
     sortedIndices[tempOffsets[assignments[i]]++] = i;
 
+var originalCount = count;
+
+var clusterFraudCounts = new int[actualNumClusters];
+for (var c = 0; c < actualNumClusters; c++)
+{
+    var start = clusterOffsets[c];
+    var end = clusterOffsets[c + 1];
+    var fraudCount = 0;
+    for (var i = start; i < end; i++)
+        fraudCount += labelBytes[sortedIndices[i]];
+    clusterFraudCounts[c] = fraudCount;
+}
+
+Console.WriteLine(
+    $"Applying intermediate pruning strategy (n>={PruneMinClusterSize}, fraud_ratio<={PruneMaxFraudRatio:P0}, remove_legit_core={PruneLegitCoreFraction:P0})...");
+
+var prunedClusterCounts = new int[actualNumClusters];
+var prunedSortedIndices = new int[count];
+var writePos = 0;
+var prunedClusters = 0;
+var removedLegit = 0;
+var removedFraud = 0;
+
+for (var c = 0; c < actualNumClusters; c++)
+{
+    var vecStart = clusterOffsets[c];
+    var vecCount = clusterCounts[c];
+    var fraudCount = clusterFraudCounts[c];
+    var fraudRatio = vecCount == 0 ? 0f : (float)fraudCount / vecCount;
+
+    bool[]? removeMask = null;
+    if (vecCount >= PruneMinClusterSize && fraudRatio <= PruneMaxFraudRatio)
+    {
+        var legitCount = vecCount - fraudCount;
+        var removeCount = (int)(legitCount * PruneLegitCoreFraction);
+        if (removeCount > 0)
+        {
+            var legitDistances = new float[legitCount];
+            var legitLocalIndices = new int[legitCount];
+            var legitPos = 0;
+            var centroidBase = c * Dim;
+
+            for (var local = 0; local < vecCount; local++)
+            {
+                var srcIdx = sortedIndices[vecStart + local];
+                if (labelBytes[srcIdx] != 0) continue;
+
+                var srcBase = srcIdx * Dim;
+                var dist = 0.0f;
+                for (var d = 0; d < Dim; d++)
+                {
+                    var diff = rawVectors[srcBase + d] - centroids[centroidBase + d];
+                    dist += diff * diff;
+                }
+
+                legitDistances[legitPos] = dist;
+                legitLocalIndices[legitPos] = local;
+                legitPos++;
+            }
+
+            Array.Sort(legitDistances, legitLocalIndices, 0, legitPos);
+            if (removeCount > legitPos) removeCount = legitPos;
+
+            removeMask = new bool[vecCount];
+            for (var i = 0; i < removeCount; i++)
+                removeMask[legitLocalIndices[i]] = true;
+
+            if (removeCount > 0)
+                prunedClusters++;
+        }
+    }
+
+    var keptInCluster = 0;
+    for (var local = 0; local < vecCount; local++)
+    {
+        var srcIdx = sortedIndices[vecStart + local];
+        var label = labelBytes[srcIdx];
+
+        if (removeMask != null && removeMask[local])
+        {
+            if (label == 0) removedLegit++;
+            else removedFraud++;
+            continue;
+        }
+
+        prunedSortedIndices[writePos++] = srcIdx;
+        keptInCluster++;
+    }
+
+    prunedClusterCounts[c] = keptInCluster;
+}
+
+if (removedFraud > 0)
+    throw new InvalidOperationException("Intermediate pruning must not remove fraud references.");
+
+if (writePos < prunedSortedIndices.Length)
+    Array.Resize(ref prunedSortedIndices, writePos);
+
+sortedIndices = prunedSortedIndices;
+clusterCounts = prunedClusterCounts;
+count = writePos;
+
+var removedTotal = originalCount - count;
+Console.WriteLine(
+    $"Pruned {removedTotal} vectors ({removedTotal * 100.0 / originalCount:F2}%). Removed legit={removedLegit}, fraud={removedFraud}, clusters touched={prunedClusters}.");
+
+clusterOffsets = new int[actualNumClusters + 1];
+for (var c = 0; c < actualNumClusters; c++)
+    clusterOffsets[c + 1] = clusterOffsets[c] + clusterCounts[c];
+
 var totalBlocks = 0;
 for (var c = 0; c < actualNumClusters; c++)
     totalBlocks += (clusterCounts[c] + BlockSlots - 1) / BlockSlots;
@@ -235,6 +348,6 @@ using (var writer = new BinaryWriter(output))
     writer.Write(blockBytes);
 }
 
-Console.WriteLine($"Done: {count} vectors, {actualNumClusters} clusters, {totalBlocks} blocks (padded to {paddedN})");
+Console.WriteLine($"Done: kept {count}/{originalCount} vectors, {actualNumClusters} clusters, {totalBlocks} blocks (padded to {paddedN})");
 Console.WriteLine($"  {outputPath}: {new FileInfo(outputPath).Length / (1024.0 * 1024.0):F1} MB");
 return 0;

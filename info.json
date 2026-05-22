@@ -2,6 +2,12 @@
     "participants": ["Devair Aparecido Restani Junior"],
     "social": ["https://github.com/devairrestani", "https://www.linkedin.com/in/devair-restani/"],
     "source-code-repo": "https://github.com/DevairRestani/rinha-de-backend-2026",
-    "stack": [],
+    "stack": [
+        ".NET 10 (ASP.NET Core / Kestrel)",
+        "C#",
+        "HAProxy 2.9",
+        "Unix Domain Sockets",
+        "Docker (Alpine Linux)"
+    ],
     "open_to_work": false
 }
