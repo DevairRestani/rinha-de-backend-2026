@@ -1,62 +1,49 @@
-version: "3.8"
 services:
-  api1:
-    image: sua-imagem:latest
+  api1: &api
+    image: juninhox11/rinha-fraud:latest
     hostname: api1
-    depends_on:
-      - db
     environment:
-      - DB_HOST=db
+      - SOCK=/run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.30"
-          memory: "90MB"
-    networks:
-      - rinha-net
+          cpus: "0.45"
+          memory: "160MB"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
+
   api2:
-    image: sua-imagem:latest
+    <<: *api
     hostname: api2
-    depends_on:
-      - db
     environment:
-      - DB_HOST=db
-    deploy:
-      resources:
-        limits:
-          cpus: "0.30"
-          memory: "90MB"
-    networks:
-      - rinha-net
-  nginx:
-    image: nginx:latest
-    ports:
-      - "9999:9999"
+      - SOCK=/run/sock/api2.sock
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    restart: always
     depends_on:
       - api1
       - api2
-    deploy:
-      resources:
-        limits:
-          cpus: "0.15"
-          memory: "30MB"
+    ports:
+      - "9999:9999"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      - rinha-net
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: rinha
-      POSTGRES_PASSWORD: rinha
-      POSTGRES_DB: rinha
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.25"
-          memory: "140MB"
-    networks:
-      - rinha-net
-networks:
-  rinha-net:
-    driver: bridge
+          cpus: "0.1"
+          memory: "30MB"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  sock:
