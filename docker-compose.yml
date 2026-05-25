@@ -15,9 +15,6 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-    security_opt:
-      - seccomp:unconfined
-
   api2:
     <<: *api
     hostname: api2
